@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时数据（数据库/备份/导出文件）不进版本库，首次运行自动创建
+data/
+
+# IDE
+.idea/
+.vscode/
+
+# 系统文件
+.DS_Store
+Thumbs.db

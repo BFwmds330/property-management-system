@@ -1,0 +1,2 @@
+# 本项目仅使用 Python 标准库（sqlite3 / csv / decimal / unicodedata 等），无第三方依赖。
+# 运行环境：Python >= 3.10
