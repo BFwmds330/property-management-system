@@ -134,8 +134,9 @@ CREATE TABLE IF NOT EXISTS bill (
   amount_received   INTEGER NOT NULL DEFAULT 0,
   status            TEXT    NOT NULL DEFAULT '未缴',
   adjust_reason     TEXT    NOT NULL DEFAULT '',
+  unit_no           TEXT    NOT NULL DEFAULT '',  -- 分缴单元标识：''=整户账单；车位费=车位号/车牌
   created_at        TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
-  UNIQUE (house_id, fee_item_id, period)
+  UNIQUE (house_id, fee_item_id, period, unit_no)
 );
 
 CREATE TABLE IF NOT EXISTS payment (
@@ -197,6 +198,54 @@ CREATE INDEX IF NOT EXISTS idx_pay_comm    ON payment(community_id);
 """
 
 
+def _table_columns(conn, table):
+    return [r[1] for r in conn.execute(f'PRAGMA table_info({table})')]
+
+
+def migrate(conn):
+    """旧库结构升级：bill 表增加 unit_no 列（支持车位费按车位分缴）。
+
+    SQLite 无法修改约束，需按官方方案重建表（先关外键，复制数据后替换）。
+    返回是否执行了升级。
+    """
+    if 'unit_no' in _table_columns(conn, 'bill'):
+        return False
+    conn.executescript('''
+        PRAGMA foreign_keys=OFF;
+        BEGIN;
+        CREATE TABLE bill_new (
+          id                INTEGER PRIMARY KEY AUTOINCREMENT,
+          community_id      INTEGER NOT NULL REFERENCES community(id) ON DELETE CASCADE,
+          house_id          INTEGER NOT NULL REFERENCES house(id) ON DELETE CASCADE,
+          fee_item_id       INTEGER NOT NULL REFERENCES fee_item(id) ON DELETE CASCADE,
+          period            TEXT    NOT NULL,
+          original_amount   INTEGER NOT NULL,
+          adjust_amount     INTEGER NOT NULL DEFAULT 0,
+          amount_receivable INTEGER NOT NULL,
+          amount_received   INTEGER NOT NULL DEFAULT 0,
+          status            TEXT    NOT NULL DEFAULT '未缴',
+          adjust_reason     TEXT    NOT NULL DEFAULT '',
+          unit_no           TEXT    NOT NULL DEFAULT '',
+          created_at        TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
+          UNIQUE (house_id, fee_item_id, period, unit_no)
+        );
+        INSERT INTO bill_new(id, community_id, house_id, fee_item_id, period, original_amount,
+                             adjust_amount, amount_receivable, amount_received, status,
+                             adjust_reason, created_at, unit_no)
+        SELECT id, community_id, house_id, fee_item_id, period, original_amount,
+               adjust_amount, amount_receivable, amount_received, status,
+               adjust_reason, created_at, ''
+        FROM bill;
+        DROP TABLE bill;
+        ALTER TABLE bill_new RENAME TO bill;
+        CREATE INDEX IF NOT EXISTS idx_bill_comm ON bill(community_id, period);
+        CREATE INDEX IF NOT EXISTS idx_bill_house ON bill(house_id);
+        COMMIT;
+        PRAGMA foreign_keys=ON;
+    ''')
+    return True
+
+
 def connect():
     """打开（必要时创建）数据库连接并确保表结构就绪。"""
     d = os.path.dirname(DB_PATH)
@@ -206,6 +255,8 @@ def connect():
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA foreign_keys=ON')
     conn.executescript(SCHEMA)
+    if migrate(conn):
+        print('[数据库升级] 已自动升级账单表：支持车位费按车位分缴，历史数据已保留。')
     conn.commit()
     return conn
 

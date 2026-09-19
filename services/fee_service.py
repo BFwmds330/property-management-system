@@ -84,7 +84,7 @@ def item_price_text(item):
         return f'{item["unit_price"]:.2f} 元/㎡/月'
     if item['pricing_type'] == '按户固定':
         return f'{item["fixed_amount"]:.2f} 元/户/{item["period_type"]}'
-    return f'{item["fixed_amount"]:.2f} 元/车位/{item["period_type"]}'
+    return f'{item["fixed_amount"]:.2f} 元/车位/{item["period_type"]}（每车位单独出账）'
 
 
 # ---------- 账单生成 ----------
@@ -93,8 +93,16 @@ def _months(period_type):
     return {'月': 1, '季': 3, '年': 12}.get(period_type, 1)
 
 
-def calc_amount(item, area_gross, vehicle_count=0):
-    """按计价标准计算单笔账单应收金额（分）；不适用（金额为 0）返回 None。"""
+def _to_cents(yuan):
+    """元（REAL）转分整数。"""
+    return int((Decimal(str(yuan or 0)) * 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+
+
+def calc_amount(item, area_gross):
+    """按计价标准计算单笔账单应收金额（分）；不适用（金额为 0）返回 None。
+
+    按车位计费的账单按"每个车位一张账单"生成，见 preview_bills。
+    """
     pt = item['pricing_type']
     if pt == '面积单价':
         if not area_gross:
@@ -102,54 +110,113 @@ def calc_amount(item, area_gross, vehicle_count=0):
         amt = Decimal(str(item['unit_price'] or 0)) * Decimal(str(area_gross)) * _months(item['period_type'])
     elif pt == '按户固定':
         amt = Decimal(str(item['fixed_amount'] or 0))
-    else:  # 按车位：按房屋名下车位数计费
-        if not vehicle_count:
-            return None
-        amt = Decimal(str(item['fixed_amount'] or 0)) * vehicle_count
-    cents = int((amt * 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    else:  # 按车位：每个车位固定金额，由 preview_bills 逐车位调用
+        amt = Decimal(str(item['fixed_amount'] or 0))
+    cents = _to_cents(amt)
     return cents if cents > 0 else None
 
 
-def vehicle_counts(conn, cid):
+def bill_room_label(bill_row):
+    """账单所属房号展示：车位分缴账单追加车位标识，如 1# 1单元 101室（车位 D001）。"""
+    base = label_of(bill_row)
+    unit = (bill_row['unit_no'] or '').strip() if 'unit_no' in bill_row.keys() else ''
+    return f'{base}（车位 {unit}）' if unit else base
+
+
+def _parking_slot_bills(conn, cid, item, period):
+    """按车位计费的待生成明细：每个车位一条 {'house', 'cents', 'unit_no'}。"""
     rows = conn.execute(
-        '''SELECT h.id AS hid, COUNT(v.id) AS n FROM house h
-           LEFT JOIN vehicle v ON v.house_id=h.id
-           WHERE h.community_id=? GROUP BY h.id''', (cid,)).fetchall()
-    return {r['hid']: r['n'] for r in rows}
+        '''SELECT h.*, v.id AS vehicle_id, v.plate, v.slot_no, b.code AS bcode
+           FROM house h
+           JOIN building b ON b.id=h.building_id
+           JOIN vehicle v ON v.house_id=h.id
+           WHERE h.community_id=?
+           ORDER BY b.id, h.unit, h.floor, h.room_no, v.id''', (cid,)).fetchall()
+    cents = calc_amount(item, 0)
+    if not cents:
+        return [], 0
+    used, entries, total = set(), [], 0
+    for r in rows:
+        unit = (r['slot_no'] or '').strip() or (r['plate'] or '').strip() or ''
+        key = (r['id'], unit)
+        n = 2
+        while key in used:  # 车位号/车牌重复时追加序号，保证同户同账期唯一
+            unit = f'{unit}-{n}'
+            key = (r['id'], unit)
+            n += 1
+        used.add(key)
+        entries.append({'house': r, 'cents': cents, 'unit_no': unit})
+        total += cents
+    return entries, total
+
+
+def check_legacy_parking_bills(conn, item, period):
+    """旧版本位费为"整户一张账单"（unit_no=''）。该账期存在旧账单时阻止重新生成，避免重复计费。"""
+    if item['pricing_type'] != '按车位':
+        return
+    n = conn.execute(
+        "SELECT COUNT(*) FROM bill WHERE fee_item_id=? AND period=? AND unit_no=''",
+        (item['id'], period)).fetchone()[0]
+    if n:
+        raise ValueError(
+            f'该账期已存在旧版整户车位费账单 {n} 笔。为避免重复计费，'
+            f'请先在"账单查询"中删除其中未缴的账单后再生成，或改用其他账期。')
 
 
 def preview_bills(conn, cid, item, period):
-    """预览账单生成结果：返回 ([(房屋行, 金额分), ...], 应收合计分)。"""
+    """预览账单生成结果：返回 (entries, 应收合计分)。
+
+    entries 元素：{'house': 房屋行, 'cents': 应收分, 'unit_no': 分缴单元标识}
+    按车位计费时每个车位一条；其余计价方式每个房屋一条（unit_no=''）。
+    """
+    check_legacy_parking_bills(conn, item, period)
+    if item['pricing_type'] == '按车位':
+        return _parking_slot_bills(conn, cid, item, period)
     houses = conn.execute(
         '''SELECT h.*, b.code AS bcode FROM house h JOIN building b ON b.id=h.building_id
            WHERE h.community_id=? ORDER BY b.id, h.unit, h.floor, h.room_no''', (cid,)).fetchall()
-    vc = vehicle_counts(conn, cid)
     entries, total = [], 0
     for h in houses:
-        cents = calc_amount(item, h['area_gross'], vc.get(h['id'], 0))
+        cents = calc_amount(item, h['area_gross'])
         if cents:
-            entries.append((h, cents))
+            entries.append({'house': h, 'cents': cents, 'unit_no': ''})
             total += cents
     return entries, total
 
 
 def generate(conn, cid, item, period):
-    """为范围内全部适用房屋生成账单（已存在的房-项目-账期自动跳过）。"""
+    """为范围内全部适用对象生成账单（已存在的房-项目-账期-分缴单元自动跳过）。"""
     entries, total = preview_bills(conn, cid, item, period)
     created = skipped = 0
-    for h, cents in entries:
-        dup = conn.execute('SELECT 1 FROM bill WHERE house_id=? AND fee_item_id=? AND period=?',
-                           (h['id'], item['id'], period)).fetchone()
+    for e in entries:
+        h = e['house']
+        dup = conn.execute(
+            'SELECT 1 FROM bill WHERE house_id=? AND fee_item_id=? AND period=? AND unit_no=?',
+            (h['id'], item['id'], period, e['unit_no'])).fetchone()
         if dup:
             skipped += 1
             continue
         conn.execute(
             "INSERT INTO bill(community_id,house_id,fee_item_id,period,original_amount,"
-            "amount_receivable,status) VALUES (?,?,?,?,?,?,'未缴')",
-            (cid, h['id'], item['id'], period, cents, cents))
+            "amount_receivable,status,unit_no) VALUES (?,?,?,?,?,?,'未缴',?)",
+            (cid, h['id'], item['id'], period, e['cents'], e['cents'], e['unit_no']))
         created += 1
     conn.commit()
     return created, skipped, total
+
+
+def delete_bill(conn, bill_id):
+    """删除账单（仅限未缴且无任何缴费记录），写入操作日志。"""
+    b = get_bill(conn, bill_id)
+    if not b:
+        raise ValueError('账单不存在或已被删除')
+    if b['amount_received'] > 0:
+        raise ValueError('该账单已有缴费记录，不能删除；如需调整请使用"账单金额调整"')
+    conn.execute('DELETE FROM bill WHERE id=?', (bill_id,))
+    conn.commit()
+    log_service.add(conn, b['community_id'], '删除账单',
+                    f'{bill_room_label(b)} {b["period"]} {b["item_name"]} '
+                    f'应收 {b["amount_receivable"] / 100:.2f} 元')
 
 
 # ---------- 账单查询 ----------
@@ -297,7 +364,7 @@ def sms_text(community_name, house_label, item_name, period, owner_name,
 
 def payments_query(conn, cid, *, kw='', item_id=None, date_from='', date_to='', limit=1000):
     sql = '''
-SELECT p.*, b.period, i.name AS item_name, h.room_no, h.unit, bld.code AS bcode, r.name AS owner_name
+SELECT p.*, b.period, b.unit_no, i.name AS item_name, h.room_no, h.unit, bld.code AS bcode, r.name AS owner_name
 FROM payment p
 JOIN bill b ON b.id=p.bill_id
 JOIN fee_item i ON i.id=b.fee_item_id

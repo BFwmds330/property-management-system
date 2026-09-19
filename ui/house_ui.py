@@ -168,7 +168,8 @@ def _detail(ctx, h):
                     [[v['plate'], v['slot_no'] or '-', v['remark']] for v in vehicles])
     unpaid = fee_service.unpaid_bills(ctx.conn, h['id'])
     if unpaid:
-        data = [[b['period'], b['item_name'], f'{b["amount_receivable"] / 100:.2f}',
+        data = [[b['period'], b['item_name'] + (f'（车位 {b["unit_no"]}）' if b['unit_no'] else ''),
+                 f'{b["amount_receivable"] / 100:.2f}',
                  f'{b["amount_received"] / 100:.2f}',
                  f'{(b["amount_receivable"] - b["amount_received"]) / 100:.2f}', b['status']]
                 for b in unpaid]

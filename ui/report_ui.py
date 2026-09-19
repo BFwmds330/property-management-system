@@ -91,11 +91,57 @@ def compare_ui(ctx):
         print(colors.green(f'  [成功] 已导出 -> {path}'))
 
 
+def vehicle_stats_ui(ctx):
+    """每户车辆信息统计（可选关联本期车位费缴纳情况）。"""
+    try:
+        period = ask_str('车位费账期（如 2026-09，留空=仅统计车辆信息）', max_len=10)
+    except CancelInput:
+        print('  已取消。')
+        return
+    result = report_service.vehicle_stats(ctx.conn, ctx.community_id, period)
+    rows, s = result['rows'], result['summary']
+    if not rows:
+        print('  ! 当前小区暂无房屋。')
+        return
+    data = []
+    for i, r in enumerate(rows):
+        fee_col = '-'
+        if period:
+            fee_col = (f'缴清{r["parking_fee_paid"]}笔/未缴{r["parking_fee_unpaid"]}笔'
+                       if r['vehicle_count'] or r['parking_fee_paid'] or r['parking_fee_unpaid']
+                       else '无车位费账单')
+            if r['parking_fee_arrears']:
+                fee_col += f'（欠 {r["parking_fee_arrears"] / 100:.2f} 元）'
+        data.append([i + 1, r['house_label'], r['owner_name'], r['tenant_name'],
+                     r['vehicle_count'] or '-', r['vehicles'] or '-', fee_col])
+    print(f'  每户车辆信息统计（当前小区：{ctx.community_name}）')
+    print_table(['序号', '房号', '业主', '租户', '车辆数', '车牌（车位）', '车位费情况'], data,
+                ['l', 'l', 'l', 'l', 'r', 'l', 'l'])
+    from services import community_service
+    comm = community_service.get(ctx.conn, ctx.community_id)
+    print(f'  汇总：登记车辆 {s["total_vehicles"]} 辆；有车 {s["houses_with_vehicle"]} 户，'
+          f'无车 {s["houses_without_vehicle"]} 户；小区规划车位 {comm["parking_total"]} 个'
+          + (f'（车位使用率 {s["total_vehicles"] / comm["parking_total"] * 100:.1f}%）'
+             if comm['parking_total'] else ''))
+    if period:
+        print(f'  本期（{period}）车位费欠费合计：{s["parking_fee_arrears"] / 100:.2f} 元')
+    if confirm('是否导出 CSV？', default=False):
+        path = exporter.export_csv(
+            f'每户车辆统计_{ctx.community_name}',
+            ['房号', '业主', '租户', '车辆数', '车牌（车位）',
+             '车位费缴清笔数', '车位费未缴笔数', '车位费欠费(元)'],
+            [[r['house_label'], r['owner_name'], r['tenant_name'], r['vehicle_count'],
+              r['vehicles'], r['parking_fee_paid'], r['parking_fee_unpaid'],
+              f'{r["parking_fee_arrears"] / 100:.2f}'] for r in rows])
+        print(colors.green(f'  [成功] 已导出 -> {path}'))
+
+
 def run(ctx):
     menu.run_menu(ctx, '统计报表', [
         ('1', '账期收缴报表', period_report_ui),
         ('2', '年度收缴报表', year_report_ui),
         ('3', '欠费金额 Top 10', top_arrears_ui),
         ('4', '各小区收缴率对比', compare_ui),
+        ('5', '每户车辆统计（车位分缴情况）', vehicle_stats_ui),
     ])
     return True

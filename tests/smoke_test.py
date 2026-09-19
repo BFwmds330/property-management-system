@@ -13,8 +13,9 @@ os.environ['PROPERTY_DB_PATH'] = os.path.join(tempfile.mkdtemp(), 'smoke.db')
 
 import db  # noqa: E402
 from services import (building_service as bs, community_service as cs,  # noqa: E402
-                      demo_data, fee_service as fs, house_service as hs,
-                      housetype_service as ts, log_service, resident_service as rs)
+                      demo_data, extra_service as es, fee_service as fs,
+                      house_service as hs, housetype_service as ts,
+                      log_service, resident_service as rs)
 from services import report_service as rpt  # noqa: E402
 from utils import exporter  # noqa: E402
 from utils.validators import (check_id_card, check_money, check_phone,  # noqa: E402
@@ -172,6 +173,98 @@ check('账期格式校验（月/季/年）',
 check('金额转分（两位小数、拒绝负数与三位小数）',
       check_money('350.5')[1] == 35050 and not check_money('-1')[0]
       and not check_money('1.234')[0])
+
+print('\n== 11. 车位费按车位分缴 ==')
+es.add_vehicle(conn, hid3, '京A11111', 'D001')
+es.add_vehicle(conn, hid3, '京B22222', 'D002')
+fidp = fs.create_item(conn, cid3, dict(name='车位费', pricing_type='按车位',
+                                       fixed_amount=150.0, period_type='月', enabled=True))
+created, skipped, total = fs.generate(conn, cid3, fs.get_item(conn, fidp), '2026-09')
+check('两个车位各生成一张账单（每张 150 元）', created == 2 and total == 30000,
+      f'created={created}, total={total}')
+slot_bills = [b for b in fs.bills_query(conn, cid3, period='2026-09')
+              if b['item_name'] == '车位费']
+check('两张账单车位标识互不相同', len(slot_bills) == 2
+      and len({b['unit_no'] for b in slot_bills}) == 2)
+check('车位账单展示含车位标识',
+      all('车位' in fs.bill_room_label(b) for b in slot_bills))
+fs.pay(conn, slot_bills[0]['id'], 15000, '2026-09-10', '现金', 'P1', '测试员')
+fs.pay(conn, slot_bills[1]['id'], 5000, '2026-09-11', '现金', 'P2', '测试员')
+check('车位1全额缴清、车位2部分缴纳（分缴独立）',
+      fs.get_bill(conn, slot_bills[0]['id'])['status'] == '已缴清'
+      and fs.get_bill(conn, slot_bills[1]['id'])['status'] == '部分缴纳')
+arr = fs.arrears_rows(conn, cid3)
+check('欠费清单按车位分列（车位2欠 100 元）',
+      any(a['bill']['id'] == slot_bills[1]['id'] and a['balance'] == 10000 for a in arr))
+# 再次生成同账期：跳过已存在，不重复计费
+again, again_skip, _ = fs.generate(conn, cid3, fs.get_item(conn, fidp), '2026-09')
+check('重复生成车位费自动跳过', again == 0 and again_skip == 2)
+
+print('\n== 12. 删除未缴账单 ==')
+try:
+    fs.delete_bill(conn, slot_bills[1]['id'])
+    check('有缴费记录的账单拒绝删除', False)
+except ValueError:
+    check('有缴费记录的账单拒绝删除',
+          fs.get_bill(conn, slot_bills[1]['id']) is not None)
+try:
+    fs.delete_bill(conn, slot_bills[0]['id'])
+    check('已缴清账单拒绝删除', False)
+except ValueError:
+    check('已缴清账单拒绝删除', True)
+fid4 = fs.create_item(conn, cid3, dict(name='临时清洁费', pricing_type='按户固定',
+                                       fixed_amount=10.0, period_type='月', enabled=True))
+fs.generate(conn, cid3, fs.get_item(conn, fid4), '2026-09')
+tmp_bill = [b for b in fs.bills_query(conn, cid3, period='2026-09')
+            if b['item_name'] == '临时清洁费'][0]
+fs.delete_bill(conn, tmp_bill['id'])
+check('无缴费记录的未缴账单可删除', fs.get_bill(conn, tmp_bill['id']) is None)
+logs = log_service.recent(conn, 50, cid3)
+check('删除账单已写入操作日志', any(l['action'] == '删除账单' for l in logs))
+
+print('\n== 13. 每户车辆统计 ==')
+stats = rpt.vehicle_stats(conn, cid3, '2026-09')
+row3 = [r for r in stats['rows'] if r['house_id'] == hid3][0]
+check('每户车辆数 = 2', row3['vehicle_count'] == 2)
+check('车牌车位明细完整', '京A11111' in row3['vehicles'] and 'D002' in row3['vehicles'])
+check('本期车位费：缴清 1 笔 / 未缴 1 笔（部分缴纳仍计未缴）',
+      row3['parking_fee_paid'] == 1 and row3['parking_fee_unpaid'] == 1,
+      f"paid={row3['parking_fee_paid']}, unpaid={row3['parking_fee_unpaid']}")
+check('车位费欠费合计 = 100 元（150 应收 - 50 已缴）',
+      row3['parking_fee_arrears'] == 10000, f"{row3['parking_fee_arrears']}")
+check('统计汇总车辆数 = 2，有车 1 户',
+      stats['summary']['total_vehicles'] == 2
+      and stats['summary']['houses_with_vehicle'] == 1)
+stats_no_period = rpt.vehicle_stats(conn, cid3)
+check('不带账期仅统计车辆信息',
+      stats_no_period['summary']['total_vehicles'] == 2
+      and stats_no_period['rows'][0]['parking_fee_paid'] == 0)
+
+print('\n== 14. 旧库迁移（账单表增加 unit_no）==')
+import sqlite3 as _sq  # noqa: E402
+legacy_path = os.path.join(tempfile.mkdtemp(), 'legacy.db')
+c2 = _sq.connect(legacy_path)
+c2.row_factory = _sq.Row
+c2.execute('''CREATE TABLE bill (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, community_id INTEGER NOT NULL, house_id INTEGER NOT NULL,
+  fee_item_id INTEGER NOT NULL, period TEXT NOT NULL, original_amount INTEGER NOT NULL,
+  adjust_amount INTEGER NOT NULL DEFAULT 0, amount_receivable INTEGER NOT NULL,
+  amount_received INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT '未缴',
+  adjust_reason TEXT NOT NULL DEFAULT '', created_at TEXT,
+  UNIQUE (house_id, fee_item_id, period))''')
+c2.execute("INSERT INTO bill(community_id, house_id, fee_item_id, period, original_amount, "
+           "amount_receivable, status, created_at) "
+           "VALUES (1, 1, 1, '2026-08', 10000, 10000, '未缴', '2026-08-01 10:00:00')")
+c2.commit()
+check('迁移前无 unit_no 列', 'unit_no' not in [r[1] for r in c2.execute('PRAGMA table_info(bill)')])
+changed = db.migrate(c2)
+cols = [r[1] for r in c2.execute('PRAGMA table_info(bill)')]
+check('迁移后账单表包含 unit_no 列', changed and 'unit_no' in cols)
+old_row = c2.execute('SELECT * FROM bill WHERE id=1').fetchone()
+check('迁移保留原账单数据', old_row is not None and old_row['amount_receivable'] == 10000
+      and old_row['unit_no'] == '')
+check('重复迁移为幂等操作', db.migrate(c2) is False)
+c2.close()
 
 print('\n' + '=' * 50)
 failed = [n for n, ok in checks if not ok]

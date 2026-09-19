@@ -2,7 +2,7 @@
 """数据字典与业务常量（建表 DDL 见 db.py，字段级设计说明见 docs/DESIGN.md）。"""
 
 APP_NAME = '智慧物业管理系统'
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 
 GENDERS = ['男', '女', '保密']
 ID_TYPES = ['身份证', '护照', '其他']

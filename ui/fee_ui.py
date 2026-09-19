@@ -110,14 +110,21 @@ def generate_ui(ctx):
         return
     entries, total = fee_service.preview_bills(ctx.conn, ctx.community_id, item, period)
     if not entries:
-        print('  ! 没有适用的房屋（按车位计费时需房屋名下已登记车辆）。')
+        print('  ! 没有适用的收费对象'
+              + ('（按车位计费需房屋名下已登记车辆，每个车位单独出账）。' if item['pricing_type'] == '按车位' else '。'))
         return
-    preview = [[house_service.label_of(h), f'{c / 100:.2f}'] for h, c in entries[:8]]
+    preview = []
+    for e in entries[:8]:
+        h = e['house']
+        preview.append([fee_service.bill_room_label(
+            {'bcode': h['bcode'], 'unit': h['unit'], 'room_no': h['room_no'],
+             'unit_no': e['unit_no']}), f'{e["cents"] / 100:.2f}'])
     print_table(['房号', '应收金额(元)'], preview)
     if len(entries) > 8:
         print(f'  ……（仅预览前 8 条，共 {len(entries)} 笔）')
+    tip = '（车位费按车位分缴：每个车位一张账单，可独立缴费）' if item['pricing_type'] == '按车位' else ''
     print(f'  预计生成 {len(entries)} 笔账单，应收总额 {tables.money(total)} 元'
-          f'（已存在的账单将自动跳过）。')
+          f'（已存在的账单将自动跳过）。{tip}')
     if not confirm('确认生成？', default=True):
         print('  已取消生成。')
         return
@@ -126,7 +133,7 @@ def generate_ui(ctx):
 
 
 def _bill_rows(bills):
-    return [[b['period'], house_service.label_of(b), b['owner_name'] or '-', b['item_name'],
+    return [[b['period'], fee_service.bill_room_label(b), b['owner_name'] or '-', b['item_name'],
              f'{b["amount_receivable"] / 100:.2f}', f'{b["amount_received"] / 100:.2f}',
              f'{(b["amount_receivable"] - b["amount_received"]) / 100:.2f}', b['status'],
              f'{b["adjust_amount"] / 100:+.2f}' if b['adjust_amount'] else '-']
@@ -165,6 +172,16 @@ def bill_query_ui(ctx):
             ['账期', '房号', '业主', '收费项目', '应收(元)', '已收(元)', '余额(元)', '状态', '调整(元)'],
             [[c for c in row] for row in _bill_rows(bills)])
         print(colors.green(f'  [成功] 已导出 -> {path}'))
+    idx = ask_int('输入序号可删除对应"未缴"账单（仅限无任何缴费记录，0 跳过）',
+                  minv=0, maxv=len(bills), default=0)
+    if idx:
+        b = bills[idx - 1]
+        if confirm(f'确认删除账单：{fee_service.bill_room_label(b)} {b["period"]} '
+                   f'{b["item_name"]}（应收 {b["amount_receivable"] / 100:.2f} 元）？', default=False):
+            fee_service.delete_bill(ctx.conn, b['id'])
+            print(colors.green('  [成功] 账单已删除并写入操作日志。'))
+        else:
+            print('  已取消删除。')
 
 
 # ---------- 缴费登记 ----------
@@ -271,7 +288,7 @@ def _arrears_data(rows):
     for a in rows:
         b = a['bill']
         tag = '超90天' if a['days'] > 90 else ''
-        data.append([house_service.label_of(b), b['owner_name'] or '-', b['item_name'],
+        data.append([fee_service.bill_room_label(b), b['owner_name'] or '-', b['item_name'],
                      b['period'], f'{a["balance"] / 100:.2f}', a['days'],
                      f'{a["late_fee"] / 100:.2f}', tag])
     return data
@@ -305,7 +322,7 @@ def demand_export_ui(ctx):
     data = []
     for a in rows:
         b = a['bill']
-        data.append([house_service.label_of(b), b['owner_name'] or '-', b['owner_phone'] or '',
+        data.append([fee_service.bill_room_label(b), b['owner_name'] or '-', b['owner_phone'] or '',
                      b['item_name'], b['period'], f'{a["balance"] / 100:.2f}', a['days'],
                      f'{a["late_fee"] / 100:.2f}',
                      f'请于见单后 7 日内缴清欠费，欠费超 90 天将按约定处理。'])
@@ -318,7 +335,7 @@ def sms_ui(ctx):
     if not rows:
         print('  当前小区没有欠费账单。')
         return
-    data = [[i + 1, house_service.label_of(a['bill']), a['bill']['owner_name'] or '-',
+    data = [[i + 1, fee_service.bill_room_label(a['bill']), a['bill']['owner_name'] or '-',
              a['bill']['item_name'], a['bill']['period'], f'{a["balance"] / 100:.2f}', a['days']]
             for i, a in enumerate(rows)]
     print_table(['序号', '房号', '业主', '收费项目', '账期', '欠费金额(元)', '欠费天数'], data,
@@ -329,7 +346,7 @@ def sms_ui(ctx):
     a = rows[idx - 1]
     from services import community_service
     comm = community_service.get(ctx.conn, ctx.community_id)
-    text = fee_service.sms_text(comm['name'], house_service.label_of(a['bill']),
+    text = fee_service.sms_text(comm['name'], fee_service.bill_room_label(a['bill']),
                                 a['bill']['item_name'], a['bill']['period'],
                                 a['bill']['owner_name'], a['balance'], a['days'],
                                 comm['service_phone'])
@@ -358,7 +375,7 @@ def payment_query_ui(ctx):
     if not rows:
         print('  ! 没有符合条件的缴费记录。')
         return
-    data = [[p['pay_date'], house_service.label_of(p), p['owner_name'] or '-', p['item_name'],
+    data = [[p['pay_date'], fee_service.bill_room_label(p), p['owner_name'] or '-', p['item_name'],
              p['period'], f'{p["amount"] / 100:.2f}', p['method'], p['receipt_no'],
              p['operator']] for p in rows]
     print_table(['缴费日期', '房号', '业主', '收费项目', '账期', '金额(元)', '方式', '收据号', '经办人'],
